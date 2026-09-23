@@ -12,11 +12,35 @@
   };
 
   const watts = (w) => (w == null ? null : `${w.toFixed(1)} W`);
+  const joined = (...parts) => parts.filter((p) => p != null).join(' · ') || null;
+
+  // Hybrid laptops also report the integrated GPU; older daemons omit it.
+  $: hasIgpu = $telemetry?.igpu_active_pct != null || $telemetry?.igpu_power_w != null;
+  $: igpuSub = joined(
+    watts($telemetry?.igpu_power_w),
+    $telemetry?.igpu_freq_mhz == null ? null : `${$telemetry.igpu_freq_mhz} MHz`
+  );
 </script>
 
-<div class="grid">
+<div class="grid" class:four={hasIgpu}>
   <Gauge value={$telemetry?.cpu_temp_c} label="CPU package" sub={watts($telemetry?.cpu_power_w)} />
-  <Gauge value={$telemetry?.gpu_temp_c} label="GPU core" sub={watts($telemetry?.gpu_power_w)} />
+  <Gauge
+    value={$telemetry?.gpu_temp_c}
+    label={hasIgpu ? 'dGPU core' : 'GPU core'}
+    sub={$telemetry?.gpu_asleep ? 'asleep' : watts($telemetry?.gpu_power_w)}
+  />
+  {#if hasIgpu}
+    <Gauge
+      value={$telemetry?.igpu_active_pct}
+      label="iGPU active"
+      unit="%"
+      min={0}
+      max={100}
+      warn={101}
+      danger={101}
+      sub={igpuSub}
+    />
+  {/if}
 
   <div class="fan card rise" style="animation-delay:80ms">
     <FanSpinner rpm={$avgRpm ?? 0} size={124} />
@@ -62,6 +86,10 @@
     gap: 14px;
   }
 
+  .grid.four {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
   .fan {
     display: flex;
     flex-direction: column;
@@ -101,6 +129,10 @@
 
   .wide2 {
     grid-column: 3;
+  }
+
+  .four .wide2 {
+    grid-column: 3 / span 2;
   }
 
   .modebar {

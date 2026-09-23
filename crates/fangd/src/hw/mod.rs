@@ -28,6 +28,8 @@ pub struct Sample {
     pub gpu_temp_c: Option<f32>,
     pub cpu_power_w: Option<f32>,
     pub gpu_power_w: Option<f32>,
+    pub gpu_asleep: bool,
+    pub igpu: sensors::IgpuReading,
     pub fan_rpm: Vec<u32>,
 }
 

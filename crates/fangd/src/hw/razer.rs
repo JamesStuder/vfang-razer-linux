@@ -356,6 +356,8 @@ impl Hw for RazerHw {
             gpu_temp_c: r.gpu_temp_c,
             cpu_power_w: r.cpu_power_w,
             gpu_power_w: r.gpu_power_w,
+            gpu_asleep: r.gpu_asleep,
+            igpu: r.igpu,
             fan_rpm,
         }
     }
@@ -408,6 +410,8 @@ impl Hw for MonitorOnly {
             gpu_temp_c: r.gpu_temp_c,
             cpu_power_w: r.cpu_power_w,
             gpu_power_w: r.gpu_power_w,
+            gpu_asleep: r.gpu_asleep,
+            igpu: r.igpu,
             fan_rpm: vec![],
         }
     }

@@ -1,5 +1,6 @@
 //! Temperature and power sources on Linux: hwmon for the CPU package
-//! temperature, RAPL (powercap) for CPU package power, NVML for the GPU.
+//! temperature, RAPL (powercap) for CPU package and uncore power, NVML for the
+//! discrete GPU, and the Intel `xe` DRM sysfs for integrated-GPU activity.
 
 use std::fs;
 use std::path::PathBuf;
@@ -12,6 +13,23 @@ pub struct Readings {
     pub gpu_temp_c: Option<f32>,
     pub cpu_power_w: Option<f32>,
     pub gpu_power_w: Option<f32>,
+    /// The dGPU is runtime-suspended, so it was deliberately not queried.
+    pub gpu_asleep: bool,
+    pub igpu: IgpuReading,
+}
+
+/// Integrated-GPU activity. Every field is `None` when unavailable.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IgpuReading {
+    /// Share of the last sample interval the render GT spent awake (out of
+    /// its idle/RC6 state), 0..=100. An awake GT is not necessarily busy, but
+    /// this is the activity signal the `xe` sysfs exposes without perf.
+    pub active_pct: Option<f32>,
+    /// RAPL uncore power, which on client Intel parts is dominated by the iGPU.
+    pub power_w: Option<f32>,
+    /// Requested render GT frequency. Unlike `act_freq`, it does not read 0
+    /// whenever the GT happens to be idle at the sampling instant.
+    pub freq_mhz: Option<u32>,
 }
 
 pub struct Sensors {
@@ -20,6 +38,8 @@ pub struct Sensors {
     nvml: NvmlState,
     nvidia_pm_dir: Option<PathBuf>,
     rapl: Option<Rapl>,
+    rapl_uncore: Option<Rapl>,
+    igpu: Option<Igpu>,
 }
 
 /// NVML session, created lazily the first time the dGPU is seen awake:
@@ -38,7 +58,7 @@ enum NvmlState {
 
 const CPU_REDISCOVER_AFTER_FAILURES: u8 = 5;
 
-/// CPU package power via the RAPL energy counter (root-readable). Power is
+/// Power of one RAPL zone via its energy counter (root-readable). Power is
 /// the energy delta between consecutive samples.
 struct Rapl {
     energy_file: PathBuf,
@@ -47,7 +67,8 @@ struct Rapl {
 }
 
 impl Rapl {
-    fn discover() -> Option<Rapl> {
+    /// Find the zone with this `name` (`package-0`, `uncore`, ...).
+    fn discover(zone: &str) -> Option<Rapl> {
         for entry in fs::read_dir("/sys/class/powercap").ok()?.flatten() {
             let dir = entry.path();
             // Prefer the MSR-backed zone; skip the duplicate -mmio zone.
@@ -58,7 +79,7 @@ impl Rapl {
                 continue;
             }
             let name = fs::read_to_string(dir.join("name")).unwrap_or_default();
-            if name.trim() == "package-0" {
+            if name.trim() == zone {
                 let max_energy_uj = fs::read_to_string(dir.join("max_energy_range_uj"))
                     .ok()?
                     .trim()
@@ -115,19 +136,30 @@ impl Sensors {
             // awake, so neither startup nor sampling wakes a suspended dGPU.
             nvml: NvmlState::Untried,
             nvidia_pm_dir,
-            rapl: Rapl::discover(),
+            rapl: Rapl::discover("package-0"),
+            rapl_uncore: Rapl::discover("uncore"),
+            igpu: Igpu::discover(),
         }
     }
 
     pub fn read(&mut self) -> Readings {
         let cpu_temp_c = self.cpu_temperature();
         let cpu_power_w = self.rapl.as_mut().and_then(Rapl::read_watts);
-        let (gpu_temp_c, gpu_power_w) = self.gpu_reading();
+        let gpu_asleep = !self.gpu_awake();
+        let (gpu_temp_c, gpu_power_w) = if gpu_asleep {
+            (None, None)
+        } else {
+            self.gpu_reading()
+        };
+        let mut igpu = self.igpu.as_mut().map(Igpu::read).unwrap_or_default();
+        igpu.power_w = self.rapl_uncore.as_mut().and_then(Rapl::read_watts);
         Readings {
             cpu_temp_c,
             gpu_temp_c,
             cpu_power_w,
             gpu_power_w,
+            gpu_asleep,
+            igpu,
         }
     }
 
@@ -163,30 +195,31 @@ impl Sensors {
         })
     }
 
-    /// dGPU temperature and power via NVML — but only when sysfs runtime-PM
-    /// says the card is awake for another user, and only after lazily creating
-    /// the NVML session (see [`NvmlState`]). Returns `(None, None)` while the
-    /// card is suspended, so neither sampling nor init ever wakes it or blocks
-    /// RTD3.
+    /// Whether sysfs runtime-PM allows querying the dGPU now. Reading these
+    /// files is free and never wakes the card; querying NVML once a second
+    /// would wake the GPU and reset its autosuspend timer, keeping it out of
+    /// RTD3 forever.
+    fn gpu_awake(&self) -> bool {
+        let Some(dir) = &self.nvidia_pm_dir else {
+            return true;
+        };
+        let read = |f: &str| {
+            fs::read_to_string(dir.join(f))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        should_query_gpu(
+            &read("control"),
+            &read("runtime_status"),
+            &read("runtime_usage"),
+        )
+    }
+
+    /// dGPU temperature and power via NVML, lazily creating the NVML session
+    /// (see [`NvmlState`]). Callers gate this on [`Self::gpu_awake`], so
+    /// neither sampling nor init ever wakes a suspended card or blocks RTD3.
     fn gpu_reading(&mut self) -> (Option<f32>, Option<f32>) {
-        // Gate on runtime-PM state (free to read, never wakes the card):
-        // querying once a second would wake the GPU and reset its autosuspend
-        // timer, keeping it out of RTD3 forever.
-        if let Some(dir) = &self.nvidia_pm_dir {
-            let read = |f: &str| {
-                fs::read_to_string(dir.join(f))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            };
-            if !should_query_gpu(
-                &read("control"),
-                &read("runtime_status"),
-                &read("runtime_usage"),
-            ) {
-                return (None, None);
-            }
-        }
         // Card is awake (or ungated because no pm dir was found): ensure the
         // NVML session exists, creating it now on first use so init itself
         // never wakes a suspended card.
@@ -247,6 +280,82 @@ fn find_nvidia_pm_dir() -> Option<PathBuf> {
     None
 }
 
+/// Intel integrated-GPU activity from the `xe` driver's sysfs: render GT
+/// idle residency (for the active share) and requested frequency. Unprivileged reads
+/// that never wake anything.
+struct Igpu {
+    idle_file: PathBuf,
+    freq_file: PathBuf,
+    last: Option<(u64, Instant)>,
+}
+
+impl Igpu {
+    fn discover() -> Option<Igpu> {
+        let igpu = find_xe_render_gt()?;
+        log::info!("igpu telemetry source: {}", igpu.display());
+        Some(Igpu {
+            idle_file: igpu.join("gtidle/idle_residency_ms"),
+            freq_file: igpu.join("freq0/cur_freq"),
+            last: None,
+        })
+    }
+
+    fn read(&mut self) -> IgpuReading {
+        let freq_mhz = read_u64(&self.freq_file).map(|f| f as u32);
+        let now = Instant::now();
+        let active_pct = read_u64(&self.idle_file).and_then(|idle_ms| {
+            let (prev_ms, prev_t) = self.last.replace((idle_ms, now))?;
+            active_share(prev_ms, idle_ms, now.duration_since(prev_t).as_secs_f64())
+        });
+        IgpuReading {
+            active_pct,
+            power_w: None,
+            freq_mhz,
+        }
+    }
+}
+
+fn read_u64(path: &std::path::Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Awake percentage from two idle-residency samples `dt_s` seconds apart.
+fn active_share(prev_idle_ms: u64, idle_ms: u64, dt_s: f64) -> Option<f32> {
+    if dt_s <= 0.0 || idle_ms < prev_idle_ms {
+        return None;
+    }
+    let idle = (idle_ms - prev_idle_ms) as f64 / 1000.0 / dt_s;
+    Some((100.0 * (1.0 - idle)).clamp(0.0, 100.0) as f32)
+}
+
+/// Find the render GT (`gtidle/name` ending in `-rc`) of a DRM card bound to
+/// the `xe` driver.
+fn find_xe_render_gt() -> Option<PathBuf> {
+    for card in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let name = card.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device = card.path().join("device");
+        let driver = fs::read_link(device.join("driver")).ok();
+        if driver.as_ref().and_then(|d| d.file_name()) != Some("xe".as_ref()) {
+            continue;
+        }
+        for tile in fs::read_dir(&device).ok()?.flatten() {
+            if !tile.file_name().to_string_lossy().starts_with("tile") {
+                continue;
+            }
+            for gt in fs::read_dir(tile.path()).ok()?.flatten() {
+                let label = fs::read_to_string(gt.path().join("gtidle/name")).unwrap_or_default();
+                if label.trim().ends_with("-rc") {
+                    return Some(gt.path());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Locate the CPU package temperature: hwmon device named coretemp (Intel)
 /// or k10temp/zenpower (AMD), preferring the package/Tctl label.
 fn find_cpu_temp() -> Option<PathBuf> {
@@ -276,7 +385,7 @@ fn find_cpu_temp() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cpu_temp, should_query_gpu};
+    use super::{active_share, parse_cpu_temp, should_query_gpu};
 
     #[test]
     fn rejects_implausible_cpu_temperatures() {
@@ -327,13 +436,28 @@ mod tests {
             nvml: NvmlState::Untried,
             nvidia_pm_dir: Some(dir.clone()),
             rapl: None,
+            rapl_uncore: None,
+            igpu: None,
         };
         let r = s.read();
         fs::remove_dir_all(&dir).ok();
         assert_eq!(r.gpu_temp_c, None, "suspended card must report no temp");
+        assert!(r.gpu_asleep, "suspended card must be reported asleep");
         assert!(
             matches!(s.nvml, NvmlState::Untried),
             "NVML must not be initialized while the card is suspended"
         );
+    }
+
+    #[test]
+    fn igpu_active_share_from_idle_residency() {
+        // 250 ms idle over 1 s is 75 % active; fully idle is 0 %.
+        assert_eq!(active_share(1_000, 1_250, 1.0), Some(75.0));
+        assert_eq!(active_share(1_000, 2_000, 1.0), Some(0.0));
+        // Clock skew can make idle exceed wall time; clamp, don't go negative.
+        assert_eq!(active_share(1_000, 2_100, 1.0), Some(0.0));
+        // A counter reset or a zero interval yields no reading.
+        assert_eq!(active_share(2_000, 1_000, 1.0), None);
+        assert_eq!(active_share(1_000, 1_000, 0.0), None);
     }
 }

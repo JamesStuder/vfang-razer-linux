@@ -312,6 +312,20 @@ pub struct Telemetry {
     /// GPU power draw in watts (NVML), when the GPU is awake.
     #[serde(default)]
     pub gpu_power_w: Option<f32>,
+    /// The discrete GPU is runtime-suspended (RTD3) and deliberately not
+    /// queried, which is why its readings are absent.
+    #[serde(default)]
+    pub gpu_asleep: bool,
+    /// Share of time the integrated GPU's render engine was awake, 0..=100,
+    /// when readable.
+    #[serde(default)]
+    pub igpu_active_pct: Option<f32>,
+    /// Integrated-GPU (RAPL uncore) power draw in watts, when readable.
+    #[serde(default)]
+    pub igpu_power_w: Option<f32>,
+    /// Integrated-GPU current frequency in MHz, when readable.
+    #[serde(default)]
+    pub igpu_freq_mhz: Option<u32>,
     /// True on AC, false on battery, None when no AC adapter is exposed
     /// (desktop, or unreadable).
     #[serde(default)]
@@ -411,6 +425,10 @@ mod tests {
             gpu_temp_c: None,
             cpu_power_w: Some(28.4),
             gpu_power_w: None,
+            gpu_asleep: true,
+            igpu_active_pct: Some(12.5),
+            igpu_power_w: Some(2.1),
+            igpu_freq_mhz: Some(1_250),
             on_ac: Some(true),
             fan_rpm: vec![2300, 2280],
             fan_target_rpm: Some(2300),
