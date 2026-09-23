@@ -69,7 +69,7 @@ replacement for every Razer device.
 
 ## Will it work on my laptop?
 
-VFang recognizes **48 Razer Blade models from 2015–2025**. Each known model has
+VFang recognizes **49 Razer Blade models from 2015–2026**. Each known model has
 its own safe fan limits and feature list.
 
 Tested x86_64 Linux bases:
